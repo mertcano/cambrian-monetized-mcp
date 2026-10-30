@@ -1,0 +1,393 @@
+import {
+  MonetizedMCPServer,
+  PaymentMethodsResponse,
+  PriceListingResponse,
+  MakePurchaseRequest,
+  MakePurchaseResponse,
+  PaymentsTools,
+  PaymentMethods,
+  PriceListingRequest,
+} from "monetizedmcp-sdk";
+import axios from "axios";
+import dotenv from "dotenv";
+import { v4 as uuidv4 } from "uuid";
+import { webcrypto } from "crypto";
+
+// Make crypto available globally for CDP SDK
+if (typeof globalThis.crypto === 'undefined') {
+  (globalThis as any).crypto = webcrypto as unknown as Crypto;
+}
+
+dotenv.config();
+
+interface CambrianEndpoint {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  method: string;
+  params: Record<string, string>;
+}
+
+// Store loaded endpoints
+let cambrianEndpoints: CambrianEndpoint[] = [];
+let lastSuccessfulLoad: Date | null = null;
+let refreshInterval: NodeJS.Timeout | null = null;
+
+// Load Cambrian endpoints from OpenAPI with automatic refresh
+async function loadCambrianEndpoints(isRefresh: boolean = false) {
+  let retries = 3;
+  let lastError: any = null;
+  
+  while (retries > 0) {
+    try {
+      const attemptMsg = isRefresh ? "Refreshing" : "Loading";
+      console.log(`${attemptMsg} Cambrian API endpoints from OpenAPI... (attempt ${4 - retries}/3)`);
+      
+      const response = await axios.get("https://opabinia.cambrian.network/openapi.json", {
+        timeout: 20000,
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'cambrian-mcp-server/1.0',
+          'Cache-Control': 'no-cache'
+        },
+        // Only 2xx counts as success; without this, a 4xx (e.g. 404) would be
+        // treated as a valid schema and silently replace the endpoint list.
+        validateStatus: (status) => status >= 200 && status < 300
+      });
+    
+      console.log(`OpenAPI schema fetched successfully at ${new Date().toISOString()}`);
+      processSchema(response.data);
+      lastSuccessfulLoad = new Date();
+      
+      // Set up hourly refresh if not already set
+      if (!refreshInterval) {
+        refreshInterval = setInterval(() => {
+          console.log("Starting hourly refresh of OpenAPI endpoints...");
+          loadCambrianEndpoints(true).catch(err => {
+            console.error("Hourly refresh failed:", err.message);
+          });
+        }, 60 * 60 * 1000); // Refresh every hour
+        console.log("Hourly refresh scheduled");
+      }
+      
+      return;
+    } catch (error: any) {
+      lastError = error;
+      retries--;
+      console.error(`Failed to load endpoints (${retries} retries left):`, error.message);
+      console.error(`Error type: ${error.code}, Status: ${error.response?.status}`);
+      
+      if (retries > 0) {
+        const waitTime = (4 - retries) * 2000; // Progressive backoff: 2s, 4s, 6s
+        console.log(`Waiting ${waitTime/1000} seconds before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+  }
+  
+  // All retries failed
+  console.error("All attempts failed. Last error:", lastError?.message);
+  console.error("Error details:", lastError?.response?.status, lastError?.response?.data);
+  
+  // If this is a refresh and we have existing endpoints, keep them
+  if (isRefresh && cambrianEndpoints.length > 0) {
+    console.log(`Refresh failed, keeping existing ${cambrianEndpoints.length} endpoints from ${lastSuccessfulLoad}`);
+    return;
+  }
+  
+  // Use fallback endpoints for initial load
+  console.log("Using fallback endpoints");
+  cambrianEndpoints = [
+    {
+      id: "solanalatestblock",
+      name: "Latest Block",
+      description: "Get the latest Solana block number and time",
+      path: "/api/v1/solana/latest-block",
+      method: "GET",
+      params: {}
+    },
+    {
+      id: "solanapricecurrent",
+      name: "Token Price (Current)",
+      description: "Get current price for a Solana token",
+      path: "/api/v1/solana/price/current",
+      method: "GET",
+      params: {
+        token_address: "Token address (base58)"
+      }
+    },
+    {
+      id: "evm-chains",
+      name: "Get EVM Chains",
+      description: "List all supported EVM chains",
+      path: "/api/v1/evm/chains",
+      method: "GET",
+      params: {}
+    }
+  ];
+  console.log(`Loaded ${cambrianEndpoints.length} fallback endpoints`);
+}
+
+// Process the OpenAPI schema
+function processSchema(schema: any) {
+  const endpoints: CambrianEndpoint[] = [];
+  let idCounter = 1;
+  
+  for (const [path, pathItem] of Object.entries(schema.paths || {}) as [string, any][]) {
+    for (const [method, operation] of Object.entries(pathItem)) {
+      if (!operation || typeof operation !== 'object') continue;
+      
+      const op = operation as any;
+      endpoints.push({
+        id: op.operationId || `endpoint-${idCounter++}`,
+        name: op.summary || `${method.toUpperCase()} ${path}`,
+        description: op.description || `Access ${path}`,
+        path: path,
+        method: method.toUpperCase(),
+        params: op.parameters?.reduce((acc: any, param: any) => {
+          acc[param.name] = param.description || param.name;
+          return acc;
+        }, {}) || {}
+      });
+    }
+  }
+  
+  cambrianEndpoints = endpoints;
+  console.log(`Successfully loaded ${endpoints.length} Cambrian API endpoints`);
+}
+
+export class MCPServer extends MonetizedMCPServer {
+  // Add health check endpoint
+  getHealthStatus() {
+    return {
+      status: cambrianEndpoints.length > 0 ? 'healthy' : 'degraded',
+      endpointsLoaded: cambrianEndpoints.length,
+      lastSuccessfulLoad: lastSuccessfulLoad?.toISOString() || 'never',
+      nextRefresh: lastSuccessfulLoad ? 
+        new Date(lastSuccessfulLoad.getTime() + 60 * 60 * 1000).toISOString() : 
+        'not scheduled'
+    };
+  }
+  
+  pricingListing(
+    pricingListingRequest: PriceListingRequest
+  ): Promise<PriceListingResponse> {
+    console.log(`PricingListing called with query: "${pricingListingRequest.searchQuery}", Available endpoints: ${cambrianEndpoints.length}`);
+    
+    // Log first few endpoint IDs for debugging
+    if (cambrianEndpoints.length > 0) {
+      console.log('Sample endpoint IDs:', cambrianEndpoints.slice(0, 5).map(e => e.id));
+    }
+    
+    const filteredItems = cambrianEndpoints
+      .filter(endpoint => 
+        !pricingListingRequest.searchQuery || 
+        endpoint.id.toLowerCase().includes(pricingListingRequest.searchQuery.toLowerCase()) ||
+        endpoint.name.toLowerCase().includes(pricingListingRequest.searchQuery.toLowerCase()) ||
+        endpoint.description.toLowerCase().includes(pricingListingRequest.searchQuery.toLowerCase())
+      )
+      .map(endpoint => ({
+        id: endpoint.id,
+        name: endpoint.name,
+        description: endpoint.description,
+        price: {
+          amount: 0.001,
+          currency: "USDC",
+          paymentMethod: PaymentMethods.USDC_BASE_MAINNET,
+        },
+        params: endpoint.params,
+      }));
+    
+    console.log(`Returning ${filteredItems.length} filtered items`);
+    return Promise.resolve({ items: filteredItems });
+  }
+  
+  paymentMethods(): Promise<PaymentMethodsResponse[]> {
+    // Fail fast instead of silently routing payments to a hard-coded address:
+    // a missing PAYMENT_RECIPIENT must be a configuration error, not a silent
+    // redirect of user funds.
+    const walletAddress = process.env.PAYMENT_RECIPIENT;
+    if (!walletAddress) {
+      console.error("PAYMENT_RECIPIENT is not configured; refusing to advertise payment methods.");
+      return Promise.reject(new Error("PAYMENT_RECIPIENT is not configured"));
+    }
+    return Promise.resolve([
+      {
+        walletAddress,
+        paymentMethod: PaymentMethods.USDC_BASE_MAINNET,
+      },
+    ]);
+  }
+  
+  async makePurchase(
+    purchaseRequest: MakePurchaseRequest
+  ): Promise<MakePurchaseResponse> {
+    try {
+      console.log(`MakePurchase called for itemId: "${purchaseRequest.itemId}"`);
+      console.log(`Available endpoints: ${cambrianEndpoints.length}`);
+      console.log('All endpoint IDs:', cambrianEndpoints.map(e => e.id));
+      
+      // Find the endpoint being purchased
+      const endpoint = cambrianEndpoints.find(e => e.id === purchaseRequest.itemId);
+      
+      if (!endpoint) {
+        console.error(`Endpoint not found: ${purchaseRequest.itemId}`);
+        return Promise.resolve({
+          purchasableItemId: purchaseRequest.itemId,
+          makePurchaseRequest: purchaseRequest,
+          orderId: uuidv4(),
+          toolResult: `Service ${purchaseRequest.itemId} not found. Available: ${cambrianEndpoints.slice(0, 5).map(e => e.id).join(', ')}...`,
+        });
+      }
+      
+      const paymentTools = new PaymentsTools();
+      const amount = 0.001; // All endpoints cost $0.001 USDC
+      // Processing payment for amount: $0.001
+
+      // Payments must never silently fall back to a hard-coded recipient:
+      // abort instead of routing user funds to an unintended address.
+      const recipient = process.env.PAYMENT_RECIPIENT;
+      if (!recipient) {
+        console.error("PAYMENT_RECIPIENT is not configured; aborting purchase.");
+        return Promise.resolve({
+          purchasableItemId: purchaseRequest.itemId,
+          makePurchaseRequest: purchaseRequest,
+          orderId: uuidv4(),
+          toolResult: JSON.stringify({
+            success: false,
+            error: "Server misconfiguration: PAYMENT_RECIPIENT is not set"
+          })
+        });
+      }
+      // Build the resource URL for this specific endpoint
+      const baseUrl = process.env.CAMBRIAN_API_BASE_URL || "https://opabinia.cambrian.network";
+      const resourceUrl = `${baseUrl}${endpoint.path}` as `${string}://${string}`;
+      
+      // Use verifyAndSettlePayment with the production pattern
+      console.log('Processing payment with:', {
+        amount,
+        recipient: process.env.PAYMENT_RECIPIENT,
+        paymentMethod: purchaseRequest.paymentMethod,
+        resourceUrl,
+        hasCDP_ID: !!process.env.CDP_API_KEY_ID,
+        hasCDP_SECRET: !!process.env.CDP_API_KEY_SECRET
+      });
+      
+      const payment = await paymentTools.verifyAndSettlePayment(
+        amount,
+        recipient as `0x${string}`,
+        {
+          facilitatorUrl: "https://x402.org/facilitator",
+          paymentHeader: purchaseRequest.signedTransaction,
+          resource: resourceUrl,
+          paymentMethod: purchaseRequest.paymentMethod,
+        }
+      );
+      
+      console.log('Payment result:', payment);
+      
+      if (payment.success) {
+        // Build the API URL with parameters
+        let apiUrl = `${baseUrl}${endpoint.path}`;
+        
+        // Handle query parameters
+        const queryParams = new URLSearchParams();
+        if (purchaseRequest.params) {
+          Object.entries(purchaseRequest.params).forEach(([key, value]) => {
+            if (value !== null && value !== undefined) {
+              queryParams.append(key, String(value));
+            }
+          });
+          
+          // Add default timeframeDays if not provided for fee ranges endpoint
+          if (endpoint.id === 'solanapoolsfeeranges' && !purchaseRequest.params.timeframeDays) {
+            queryParams.append('timeframeDays', '7');
+          }
+        }
+        
+        if (queryParams.toString()) {
+          apiUrl += `?${queryParams}`;
+        }
+        
+        try {
+          const response = await axios({
+            method: endpoint.method,
+            url: apiUrl,
+            headers: {
+              'X-API-KEY': process.env.CAMBRIAN_API_KEY,
+              'Accept': 'application/json',
+            },
+            timeout: 30000,
+          });
+          
+          return Promise.resolve({
+            purchasableItemId: purchaseRequest.itemId,
+            makePurchaseRequest: purchaseRequest,
+            orderId: uuidv4(),
+            toolResult: JSON.stringify({
+              success: true,
+              data: response.data,
+            }),
+          });
+        } catch (apiError: any) {
+          // The payment already settled, so this must NOT be reported as a
+          // plain success: the buyer paid but received no data. Report the
+          // failure honestly so callers can retry or seek a refund.
+          return Promise.resolve({
+            purchasableItemId: purchaseRequest.itemId,
+            makePurchaseRequest: purchaseRequest,
+            orderId: uuidv4(),
+            toolResult: JSON.stringify({
+              success: false,
+              paymentSuccess: true,
+              message: "Payment was settled, but the data request failed.",
+              error: apiError.message
+            }),
+          });
+        }
+      }
+      
+      // Payment verification failed
+      return Promise.resolve({
+        purchasableItemId: purchaseRequest.itemId,
+        makePurchaseRequest: purchaseRequest,
+        orderId: uuidv4(),
+        toolResult: "Payment failed: " + (payment.error || payment.message),
+      });
+      
+    } catch (error: any) {
+      console.error('MakePurchase error:', {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status,
+        paymentMethod: purchaseRequest.paymentMethod,
+        itemId: purchaseRequest.itemId
+      });
+      
+      // Return a proper error response instead of throwing
+      return Promise.resolve({
+        purchasableItemId: purchaseRequest.itemId,
+        makePurchaseRequest: purchaseRequest,
+        orderId: uuidv4(),
+        toolResult: JSON.stringify({
+          success: false,
+          error: error.message,
+          details: error.response?.data || 'Payment verification failed'
+        })
+      });
+    }
+  }
+  
+  constructor() {
+    super();
+    // Set the port from environment - Cloud Run expects 8080
+    process.env.PORT = process.env.PORT || '8080';
+    super.runMonetizeMCPServer();
+  }
+}
+
+// Initialize endpoints then start server
+loadCambrianEndpoints().then(() => {
+  new MCPServer();
+});
