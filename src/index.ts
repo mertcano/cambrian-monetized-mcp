@@ -51,7 +51,9 @@ async function loadCambrianEndpoints(isRefresh: boolean = false) {
           'User-Agent': 'cambrian-mcp-server/1.0',
           'Cache-Control': 'no-cache'
         },
-        validateStatus: (status) => status < 500
+        // Only 2xx counts as success; without this, a 4xx (e.g. 404) would be
+        // treated as a valid schema and silently replace the endpoint list.
+        validateStatus: (status) => status >= 200 && status < 300
       });
     
       console.log(`OpenAPI schema fetched successfully at ${new Date().toISOString()}`);
@@ -202,7 +204,14 @@ export class MCPServer extends MonetizedMCPServer {
   }
   
   paymentMethods(): Promise<PaymentMethodsResponse[]> {
-    const walletAddress = process.env.PAYMENT_RECIPIENT || "0x4C3B0B1Cab290300bd5A36AD5f33A607acbD7ac3";
+    // Fail fast instead of silently routing payments to a hard-coded address:
+    // a missing PAYMENT_RECIPIENT must be a configuration error, not a silent
+    // redirect of user funds.
+    const walletAddress = process.env.PAYMENT_RECIPIENT;
+    if (!walletAddress) {
+      console.error("PAYMENT_RECIPIENT is not configured; refusing to advertise payment methods.");
+      return Promise.reject(new Error("PAYMENT_RECIPIENT is not configured"));
+    }
     return Promise.resolve([
       {
         walletAddress,
@@ -235,8 +244,22 @@ export class MCPServer extends MonetizedMCPServer {
       const paymentTools = new PaymentsTools();
       const amount = 0.001; // All endpoints cost $0.001 USDC
       // Processing payment for amount: $0.001
-      
-      
+
+      // Payments must never silently fall back to a hard-coded recipient:
+      // abort instead of routing user funds to an unintended address.
+      const recipient = process.env.PAYMENT_RECIPIENT;
+      if (!recipient) {
+        console.error("PAYMENT_RECIPIENT is not configured; aborting purchase.");
+        return Promise.resolve({
+          purchasableItemId: purchaseRequest.itemId,
+          makePurchaseRequest: purchaseRequest,
+          orderId: uuidv4(),
+          toolResult: JSON.stringify({
+            success: false,
+            error: "Server misconfiguration: PAYMENT_RECIPIENT is not set"
+          })
+        });
+      }
       // Build the resource URL for this specific endpoint
       const baseUrl = process.env.CAMBRIAN_API_BASE_URL || "https://opabinia.cambrian.network";
       const resourceUrl = `${baseUrl}${endpoint.path}` as `${string}://${string}`;
@@ -253,7 +276,7 @@ export class MCPServer extends MonetizedMCPServer {
       
       const payment = await paymentTools.verifyAndSettlePayment(
         amount,
-        (process.env.PAYMENT_RECIPIENT || "0x4C3B0B1Cab290300bd5A36AD5f33A607acbD7ac3") as `0x${string}`,
+        recipient as `0x${string}`,
         {
           facilitatorUrl: "https://x402.org/facilitator",
           paymentHeader: purchaseRequest.signedTransaction,
@@ -308,15 +331,17 @@ export class MCPServer extends MonetizedMCPServer {
             }),
           });
         } catch (apiError: any) {
-          // If Cambrian API fails, still return success since payment went through
+          // The payment already settled, so this must NOT be reported as a
+          // plain success: the buyer paid but received no data. Report the
+          // failure honestly so callers can retry or seek a refund.
           return Promise.resolve({
             purchasableItemId: purchaseRequest.itemId,
             makePurchaseRequest: purchaseRequest,
             orderId: uuidv4(),
             toolResult: JSON.stringify({
-              success: true,
+              success: false,
               paymentSuccess: true,
-              message: "Payment successful. API returned an error.",
+              message: "Payment was settled, but the data request failed.",
               error: apiError.message
             }),
           });
