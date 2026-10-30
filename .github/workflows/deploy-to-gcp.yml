@@ -76,12 +76,23 @@ jobs:
           --min-instances 0 \
           --project ${{ secrets.GCP_PROJECT_ID }} \
           --service-account ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }} \
-          --set-env-vars "DEPLOY_ENV=${{ env.DEPLOY_ENV }}" \
-          --set-env-vars "NODE_ENV=production" \
-          --set-env-vars "CDP_API_KEY_ID=${{ secrets.CDP_API_KEY_ID }}" \
-          --set-env-vars "CDP_API_KEY_SECRET=${{ secrets.CDP_API_KEY_SECRET }}" \
-          --set-env-vars "CAMBRIAN_API_KEY=${{ secrets.CAMBRIAN_API_KEY }}" \
+          --set-env-vars "DEPLOY_ENV=${{ env.DEPLOY_ENV }},NODE_ENV=production" \
+          --set-secrets "CDP_API_KEY_ID=CDP_API_KEY_ID:latest,CDP_API_KEY_SECRET=CDP_API_KEY_SECRET:latest,CAMBRIAN_API_KEY=CAMBRIAN_API_KEY:latest" \
           --allow-unauthenticated
+
+        # NOTE ON SECRETS: credentials are mounted through Secret Manager
+        # (--set-secrets), never passed as plain env vars. --set-env-vars
+        # values are stored in the service definition and are visible to
+        # anyone who can read the Cloud Run service config; Secret Manager
+        # keeps them out of that surface and out of CI logs.
+        #
+        # PREREQUISITES (one-time):
+        #   gcloud secrets create CDP_API_KEY_ID   --data-file=-
+        #   gcloud secrets create CDP_API_KEY_SECRET --data-file=-
+        #   gcloud secrets create CAMBRIAN_API_KEY --data-file=-
+        #   # allow the deploy service account to read them:
+        #   gcloud secrets add-iam-policy-binding SECRET_NAME \
+        #     --member="serviceAccount:DEPLOY_SA_EMAIL" --role="roles/secretmanager.secretAccessor"
 
     - name: Get Service URL
       run: |
